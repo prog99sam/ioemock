@@ -16,6 +16,7 @@ client = OpenAI(
     api_key = os.getenv("NARAROUTER_API_KEY"),
     base_url="https://router.bynara.id/v1",
 )
+
 MODEL = os.environ.get("NARAROUTER_MODEL", "mistral-large")
 
 # --- Simple rate limiter: NaraRouter caps this key at 10 req/min ---
