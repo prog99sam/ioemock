@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { Clock, Flag, CheckCircle2, XCircle, MinusCircle, Loader2, Play, RotateCcw, ChevronLeft, ChevronRight, AlertTriangle, Settings2 } from "lucide-react";
 import "./test.css";
 
-const BACKEND_URL = "http://api.samiramgain.com.np/api/generate-questions/";
+const BACKEND_URL = "https://api.samiramgain.com.np/api/generate-questions/";
 const BATCH_SIZE = 4;
 const TOTAL_QUESTIONS = 100;
 const EXAM_SECONDS = 2 * 60 * 60;
