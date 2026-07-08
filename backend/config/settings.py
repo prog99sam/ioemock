@@ -31,7 +31,7 @@ DEBUG = True
 ALLOWED_HOSTS = [
     "localhost",
     "api.samiramgain.com.np",
-    "ioemock-backend.onrender.com",]
+    "ioemock.onrender.com",]
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "https://samiramgain.com.np",
