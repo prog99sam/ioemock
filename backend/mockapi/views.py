@@ -81,6 +81,25 @@ def _restore_matrix_blocks(text, blocks):
     return text
 
 
+_STRAY_LETTER_ESCAPE_RE = re.compile(r'(?<!\\)\\([bfnrt][a-zA-Z]+)')
+_STRAY_UNICODE_ESCAPE_RE = re.compile(r'(?<!\\)\\u(?![0-9a-fA-F]{4})')
+
+
+def repair_latex_json_escapes(raw):
+    """Models frequently emit LaTeX like \\begin, \\frac, \\rho, \\tan,
+    \\underline with only a single backslash inside the JSON string. JSON
+    treats \\b \\f \\n \\r \\t \\u as real escapes (backspace, form-feed,
+    newline, carriage-return, tab, unicode) — so a bare \\begin silently
+    parses as a backspace control character followed by the literal text
+    "egin", corrupting the LaTeX invisibly instead of raising a JSON error.
+    This doubles the backslash wherever it's clearly a multi-letter LaTeX
+    command name rather than an actual control-char escape, without
+    touching backslashes that are already correctly doubled."""
+    raw = _STRAY_LETTER_ESCAPE_RE.sub(lambda m: "\\\\" + m.group(1), raw)
+    raw = _STRAY_UNICODE_ESCAPE_RE.sub(r"\\\\u", raw)
+    return raw
+
+
 def normalize_latex(text):
     """Best-effort cleanup of near-LaTeX the model sometimes emits, and makes
     sure every math snippet is wrapped in $...$ (or $$...$$ for matrix/array
@@ -197,7 +216,8 @@ STRICT RULES:
 6. Keep explanations concise (1-2 sentences) but mathematically correct.
 7. ALL mathematics, anywhere it appears (question, options, explanation), MUST be written in standard LaTeX. Wrap simple inline expressions in single dollar signs: $\\frac{{4}}{{7}}$, $2^{{x}}$, $\\sqrt{{x}}$, $\\theta$, $\\pi$, $\\int_0^1 x\\,dx$. Never write raw pseudo-LaTeX like "frac{{4}}{{7}}" or "sqrt(x)" without the backslash and dollar signs.
 8. Matrices, determinants, and systems of equations MUST use a proper LaTeX array environment (not inline fractions or plain text), wrapped in double dollar signs as display math. Use \\begin{{vmatrix}} ... \\end{{vmatrix}} for determinants, \\begin{{pmatrix}} ... \\end{{pmatrix}} or \\begin{{bmatrix}} ... \\end{{bmatrix}} for matrices, with & separating columns and \\\\ separating rows. Example determinant: $$\\begin{{vmatrix}} 1 & a & a^{{2}} \\\\ 1 & b & b^{{2}} \\\\ 1 & c & c^{{2}} \\end{{vmatrix}}$$. Never lay out matrix rows as plain inline text.
-9. Return ONLY a raw JSON object -- no markdown fences, no preamble, no commentary, no trailing text.
+9. Your entire reply is parsed as JSON. Every backslash inside a LaTeX command MUST be written as TWO backslashes so it survives JSON parsing as one: write "\\\\frac{{1}}{{2}}" (which parses to \\frac{{1}}{{2}}) not "\\frac{{1}}{{2}}". This applies to every command: \\\\begin, \\\\end, \\\\frac, \\\\rho, \\\\tan, \\\\theta, \\\\underline, etc. A single backslash before b, f, n, r, t, or u will corrupt your output because those are reserved JSON escape characters.
+10. Return ONLY a raw JSON object -- no markdown fences, no preamble, no commentary, no trailing text.
 
 Respond with exactly this JSON schema:
 {{"questions": [{{"question":"...","options":["...","...","...","..."],"correctIndex":0,"explanation":"...","chapter":"<one of the exact chapter strings listed above>","topic":"short 3-8 word label for the specific concept tested, e.g. 'projectile motion range formula'"}}]}}
@@ -237,6 +257,7 @@ def generate_questions(request):
         )
         text = response.choices[0].message.content
         cleaned = re.sub(r"```json|```", "", text).strip()
+        cleaned = repair_latex_json_escapes(cleaned)
         parsed = json.loads(cleaned)
         questions = parsed["questions"] if isinstance(parsed, dict) else parsed
 

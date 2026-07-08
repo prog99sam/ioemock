@@ -5,6 +5,7 @@ import "./test.css";
 const BACKEND_URL = "https://api.samiramgain.com.np/api/generate-questions/";
 const BATCH_SIZE = 4;
 const TOTAL_QUESTIONS = 100;
+const MIN_REQUEST_GAP_MS = 6500; // backend caps NaraRouter calls at 10/min ≈ 1 every 6s; pace with a small safety margin
 const PART_A_COUNT = 60; // 1 mark each
 const PART_B_COUNT = 40; // 2 marks each
 const TOTAL_MARKS = PART_A_COUNT * 1 + PART_B_COUNT * 2; // 140, official IOE 2083/84 pattern
@@ -221,6 +222,7 @@ export default function IOEOfficialMock() {
 
   const fetchingRef = useRef(false);
   const configRef = useRef({ subjectDefs, difficulty });
+  const lastFetchAtRef = useRef(0);
 
   // topic-tracking: { [subject]: { [chapter]: count } }, plus a rolling
   // window of short "topic" labels used to stop the LLM repeating concepts.
@@ -280,12 +282,24 @@ export default function IOEOfficialMock() {
 
   const loadBatch = useCallback(async () => {
     if (fetchingRef.current) return;
+    fetchingRef.current = true; // claim the slot immediately so no duplicate is scheduled
+    setFetching(true);
+    setFetchError(null);
+
+    const now = Date.now();
+    const wait = Math.max(0, MIN_REQUEST_GAP_MS - (now - lastFetchAtRef.current));
+    if (wait > 0) {
+      await new Promise((resolve) => setTimeout(resolve, wait));
+    }
+
     setQuestions((prevQ) => {
       const plan = nextBatchPlan(prevQ.length, prevQ);
-      if (!plan) return prevQ;
-      fetchingRef.current = true;
-      setFetching(true);
-      setFetchError(null);
+      if (!plan) {
+        fetchingRef.current = false;
+        setFetching(false);
+        return prevQ;
+      }
+      lastFetchAtRef.current = Date.now();
       const chapterCounts = chapterCountsRef.current[plan.subjectDef.key] || {};
       fetchQuestionBatch(
         plan.subjectDef,
@@ -325,6 +339,7 @@ export default function IOEOfficialMock() {
     setFetchError(null);
     try {
       const plan = nextBatchPlan(0, []);
+      lastFetchAtRef.current = Date.now();
       const batch = await fetchQuestionBatch(
         plan.subjectDef,
         difficulty,
