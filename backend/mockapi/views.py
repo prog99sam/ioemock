@@ -11,9 +11,10 @@ from django.views.decorators.http import require_POST
 from openai import OpenAI
 from dotenv import load_dotenv
 load_dotenv()
+
 # --- NaraRouter client (OpenAI-compatible endpoint) ---
 client = OpenAI(
-    api_key = os.getenv("NARAROUTER_API_KEY"),
+    api_key=os.getenv("NARAROUTER_API_KEY"),
     base_url="https://router.bynara.id/v1",
 )
 
@@ -41,22 +42,129 @@ def wait_for_rate_limit():
         time.sleep(wait)
 
 
-def build_prompt(subject, chapters, difficulty, count):
-    chapter_list = "\n".join(f"- {c}" for c in chapters)
-    return f"""You are generating official-style practice questions for Nepal's IOE (Institute of Engineering, Tribhuvan University) B.E./B.Arch entrance examination.
+# ---------------------------------------------------------------------------
+# IOE 2083/84 official pattern: 100 questions / 140 marks / 2 hours.
+# Part A = first 60 questions @ 1 mark each, Part B = last 40 @ 2 marks each.
+# Subject marks split (Math 50 / Physics 45 / Chemistry 25 / English 20 = 140)
+# is the reference used to derive question-count targets on the frontend.
+# 10% negative marking per wrong answer, applied to that question's marks.
+# ---------------------------------------------------------------------------
 
-Generate exactly {count} multiple-choice questions for the subject: {subject}.
-Difficulty level: {difficulty}.
 
-Draw ONLY from these syllabus chapters for {subject} (spread questions across different chapters, don't repeat the same narrow sub-topic):
-{chapter_list}
+def normalize_latex(text):
+    """Best-effort cleanup of near-LaTeX the model sometimes emits, and makes
+    sure every math snippet is wrapped in $...$ so the frontend's KaTeX
+    renderer picks it up. Idempotent-ish: safe to run on already-clean text."""
+    if not text:
+        return text
 
-Match the real IOE exam style: single-mark objective questions, moderate length, testing conceptual understanding and calculation, similar to past IOE entrance papers. Every question must be fully self-contained and solvable from text alone (no images or diagrams required).
+    # Bare `frac{a}{b}`, `sqrt{x}` / `sqrt(x)` missing their backslash.
+    text = re.sub(r'(?<!\\)\bfrac\{', r'\\frac{', text)
+    text = re.sub(r'(?<!\\)\bsqrt\(([^()]+)\)', r'\\sqrt{\1}', text)
+    text = re.sub(r'(?<!\\)\bsqrt\{', r'\\sqrt{', text)
+    text = re.sub(r'(?<!\\)\bint\b', r'\\int', text)
+    text = re.sub(r'(?<!\\)\bsum\b', r'\\sum', text)
+    text = re.sub(r'(?<!\\)\blim\b', r'\\lim', text)
 
-Respond with ONLY a raw JSON object and nothing else — no markdown fences, no preamble, no commentary. Exact schema:
-{{"questions": [{{"question":"...","options":["...","...","...","..."],"correctIndex":0,"explanation":"one or two sentence explanation of the correct answer","chapter":"which chapter above this question is from"}}]}}
+    # Common bare greek letters -> \greek (word-boundary, not already escaped).
+    for g in ["pi", "theta", "alpha", "beta", "gamma", "delta", "lambda",
+              "sigma", "omega", "mu", "phi", "epsilon", "rho", "tau"]:
+        text = re.sub(rf'(?<![\\a-zA-Z]){g}(?![a-zA-Z])', rf'\\{g}', text)
 
-Rules: options must NOT include letter prefixes like "A)". correctIndex is a 0-based index into options. Keep explanations concise."""
+    # Wrap any run containing a LaTeX command or ^ / _ math syntax in $...$
+    # if it isn't already inside $ ... $ delimiters.
+    def wrap_math(match):
+        return f"${match.group(0)}$"
+
+    # Only touch segments outside existing $...$ spans.
+    parts = re.split(r'(\$[^$]*\$)', text)
+    for i, part in enumerate(parts):
+        if part.startswith('$'):
+            continue
+        # Find LaTeX-ish runs: \command...{...} or x^{..} or x_{..}
+        parts[i] = re.sub(
+            r'(\\[a-zA-Z]+(\{[^{}]*\}|\^\{[^{}]*\}|_\{[^{}]*\})*'
+            r'(\^\{[^{}]*\}|_\{[^{}]*\}|\{[^{}]*\})*|'
+            r'[A-Za-z0-9]\^\{?[A-Za-z0-9+\-]+\}?|'
+            r'[A-Za-z0-9]_\{?[A-Za-z0-9+\-]+\}?)',
+            wrap_math,
+            part,
+        )
+    text = "".join(parts)
+    # Collapse accidental doubled $$..$$ from re-wrapping adjacent tokens.
+    text = re.sub(r'\$\$+', '$', text)
+    text = re.sub(r'\$\s*\$', '', text)
+    return text
+
+
+def normalize_question_latex(q):
+    for field in ("question", "explanation"):
+        if field in q and isinstance(q[field], str):
+            q[field] = normalize_latex(q[field])
+    if isinstance(q.get("options"), list):
+        q["options"] = [normalize_latex(o) if isinstance(o, str) else o for o in q["options"]]
+    return q
+
+
+def format_chapter_priority(chapters, chapter_counts, target_count, generated_count):
+    """Builds a human-readable, count-annotated chapter list so the model can
+    see exactly which chapters are underrepresented and should be favored."""
+    remaining = max(target_count - generated_count, 0)
+    lines = []
+    # Sort chapters by how under-used they are (ascending count) so the
+    # least-covered chapters are listed first -- LLMs weight earlier items
+    # more heavily in practice.
+    scored = sorted(
+        chapters,
+        key=lambda c: chapter_counts.get(c, 0),
+    )
+    for c in scored:
+        used = chapter_counts.get(c, 0)
+        flag = " <- PRIORITIZE (least covered so far)" if used == 0 else ""
+        lines.append(f"- [{used}x used] {c}{flag}")
+    chapter_block = "\n".join(lines)
+    return chapter_block, remaining
+
+
+def build_prompt(subject, chapters, difficulty, count, chapter_counts,
+                  target_count, generated_count, recent_topics):
+    chapter_block, remaining = format_chapter_priority(
+        chapters, chapter_counts, target_count, generated_count
+    )
+
+    recent_block = (
+        "\n".join(f"- {t}" for t in recent_topics[-25:])
+        if recent_topics else "(none yet)"
+    )
+
+    return f"""You are an expert item-writer generating official-style practice questions for Nepal's IOE (Institute of Engineering, Tribhuvan University) B.E./B.Arch entrance examination.
+
+SUBJECT: {subject}
+DIFFICULTY: {difficulty}
+GENERATE EXACTLY: {count} multiple-choice questions
+
+SYLLABUS COVERAGE STATUS (chapter: how many questions already generated this attempt):
+{chapter_block}
+
+This subject's overall quota for this attempt is {target_count} questions; {generated_count} have been generated so far, {remaining} remain. Favor chapters marked "PRIORITIZE" and any with low usage counts above. Do not let any single chapter dominate -- spread coverage so the finished paper is balanced across the whole syllabus, matching realistic IOE chapter-wise weightage.
+
+SPECIFIC CONCEPTS/TOPICS ALREADY ASKED IN THIS ATTEMPT (do not repeat these, and do not generate near-duplicates or trivial numeric variations of them):
+{recent_block}
+
+STRICT RULES:
+1. Only use chapters listed above. Never invent syllabus content outside them.
+2. Never repeat a concept from the "already asked" list. Each question must test a genuinely distinct idea.
+3. Match real IOE exam style: single-concept objective questions, testing conceptual understanding, calculation, or application, similar in tone and difficulty to past IOE entrance papers.
+4. Every question must be fully self-contained and solvable from text alone (no images/diagrams/figures required).
+5. Distractors (wrong options) must be plausible -- based on common calculation errors or conceptual confusions, not random or obviously wrong.
+6. Keep explanations concise (1-2 sentences) but mathematically correct.
+7. ALL mathematics, anywhere it appears (question, options, explanation), MUST be written in standard LaTeX, wrapped in single dollar signs for inline math. Examples of correct formatting: $\\frac{{4}}{{7}}$, $2^{{x}}$, $\\sqrt{{x}}$, $\\theta$, $\\pi$, $\\int_0^1 x\\,dx$. Never write raw pseudo-LaTeX like "frac{{4}}{{7}}" or "sqrt(x)" without the backslash and dollar signs.
+8. Return ONLY a raw JSON object -- no markdown fences, no preamble, no commentary, no trailing text.
+
+Respond with exactly this JSON schema:
+{{"questions": [{{"question":"...","options":["...","...","...","..."],"correctIndex":0,"explanation":"...","chapter":"<one of the exact chapter strings listed above>","topic":"short 3-8 word label for the specific concept tested, e.g. 'projectile motion range formula'"}}]}}
+
+Rules for the schema: options must NOT include letter prefixes like "A)". correctIndex is a 0-based index into options."""
 
 
 @csrf_exempt
@@ -68,17 +176,24 @@ def generate_questions(request):
         chapters = body["chapters"]
         difficulty = body.get("difficulty", "Mixed")
         count = int(body.get("count", 4))
+        chapter_counts = body.get("chapterCounts", {}) or {}
+        target_count = int(body.get("targetCount", count))
+        generated_count = int(body.get("generatedCount", 0))
+        recent_topics = body.get("recentTopics", []) or []
     except (KeyError, json.JSONDecodeError, ValueError):
         return JsonResponse({"error": "Invalid request body"}, status=400)
 
-    prompt = build_prompt(subject, chapters, difficulty, count)
+    prompt = build_prompt(
+        subject, chapters, difficulty, count,
+        chapter_counts, target_count, generated_count, recent_topics,
+    )
 
     wait_for_rate_limit()
 
     try:
         response = client.chat.completions.create(
             model=MODEL,
-            max_tokens=1200,
+            max_tokens=1800,
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
         )
@@ -89,6 +204,7 @@ def generate_questions(request):
 
         for q in questions:
             q["subject"] = subject
+            normalize_question_latex(q)
 
         return JsonResponse({"questions": questions})
     except json.JSONDecodeError:
