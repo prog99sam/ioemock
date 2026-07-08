@@ -4,14 +4,23 @@ import "./test.css";
 
 const BACKEND_URL = "https://api.samiramgain.com.np/api/generate-questions/";
 const BATCH_SIZE = 4;
+const PREFETCH_LOOKAHEAD = 2; // start fetching the next batch this many questions before running out
 const TOTAL_QUESTIONS = 100;
+const PART_A_COUNT = 60; // 1 mark each
+const PART_B_COUNT = 40; // 2 marks each
+const TOTAL_MARKS = PART_A_COUNT * 1 + PART_B_COUNT * 2; // 140, official IOE 2083/84 pattern
 const EXAM_SECONDS = 2 * 60 * 60;
+const RECENT_TOPICS_CAP = 40;
 
+// marks scale by global question position: first 60 = 1 mark (Part A), last 40 = 2 marks (Part B)
+const marksForIndex = (i) => (i < PART_A_COUNT ? 1 : 2);
+
+// Subject weights reflect the official IOE marks split (Math 50 / Physics 45 / Chemistry 25 / English 20 = 140)
 const DEFAULT_SUBJECTS = [
   {
     key: "Mathematics",
     color: "#2E4057",
-    weight: 40,
+    weight: 50,
     chapters: [
       "Sets, relations and functions — algebraic, trigonometric, exponential, logarithmic, hyperbolic functions and their inverses",
       "Algebra — determinants, matrices, inverse of a matrix, complex numbers, polynomial equations",
@@ -28,7 +37,7 @@ const DEFAULT_SUBJECTS = [
   {
     key: "Physics",
     color: "#6B4C9A",
-    weight: 30,
+    weight: 45,
     chapters: [
       "Mechanics — dimensions, equations of motion, projectile motion, laws of motion, vector addition/subtraction, relative velocity, equilibrium of forces, moments, centre of mass/gravity, friction, work-power-energy, conservation of energy",
       "Rotational mechanics & gravitation — angular speed, centripetal force, moment of inertia, torque, angular momentum, rotational kinetic energy, laws of gravitation, escape velocity",
@@ -44,7 +53,7 @@ const DEFAULT_SUBJECTS = [
   {
     key: "Chemistry",
     color: "#3A7D44",
-    weight: 20,
+    weight: 25,
     chapters: [
       "Language of chemistry & stoichiometry — symbols, valency, chemical equations, weight-weight and weight-volume problems",
       "Atomic structure — cathode rays, Rutherford's scattering experiment, Rutherford and Bohr models, quantum numbers, electron configuration",
@@ -61,7 +70,7 @@ const DEFAULT_SUBJECTS = [
   {
     key: "English",
     color: "#C97A2B",
-    weight: 10,
+    weight: 20,
     chapters: [
       "Grammar I — parts of speech, tense and aspect, direct and indirect speech, kinds of sentences and their transformation",
       "Grammar II — conditional sentences, active and passive voice, verbals (infinitives, gerunds, participles), concord/agreement",
@@ -79,7 +88,82 @@ function formatTime(totalSeconds) {
   return `${h}:${m}:${s}`;
 }
 
-async function fetchQuestionBatch(subjectDef, difficulty, count) {
+// ---------------------------------------------------------------------------
+// KaTeX loader — injected once, lazily, so the app has no build-time deps.
+// ---------------------------------------------------------------------------
+let katexLoadPromise = null;
+function loadKatex() {
+  if (typeof window === "undefined") return Promise.resolve(false);
+  if (window.katex) return Promise.resolve(true);
+  if (katexLoadPromise) return katexLoadPromise;
+
+  katexLoadPromise = new Promise((resolve) => {
+    const cssHref = "https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css";
+    if (!document.querySelector(`link[href="${cssHref}"]`)) {
+      const link = document.createElement("link");
+      link.rel = "stylesheet";
+      link.href = cssHref;
+      document.head.appendChild(link);
+    }
+    const scriptSrc = "https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js";
+    const existing = document.querySelector(`script[src="${scriptSrc}"]`);
+    if (existing) {
+      existing.addEventListener("load", () => resolve(true));
+      if (window.katex) resolve(true);
+      return;
+    }
+    const script = document.createElement("script");
+    script.src = scriptSrc;
+    script.async = true;
+    script.onload = () => resolve(true);
+    script.onerror = () => resolve(false);
+    document.head.appendChild(script);
+  });
+  return katexLoadPromise;
+}
+
+function useKatexReady() {
+  const [ready, setReady] = useState(typeof window !== "undefined" && !!window.katex);
+  useEffect(() => {
+    let mounted = true;
+    loadKatex().then((ok) => mounted && setReady(ok));
+    return () => {
+      mounted = false;
+    };
+  }, []);
+  return ready;
+}
+
+// Renders text containing $...$ inline LaTeX spans via KaTeX; falls back to
+// plain text for anything KaTeX can't parse or before it has loaded.
+function MathText({ text, katexReady, className }) {
+  const segments = useMemo(() => {
+    if (!text) return [];
+    return String(text).split(/(\$[^$]+\$)/g).filter((s) => s !== "");
+  }, [text]);
+
+  return (
+    <span className={className}>
+      {segments.map((seg, i) => {
+        if (seg.startsWith("$") && seg.endsWith("$") && seg.length > 2) {
+          const expr = seg.slice(1, -1);
+          if (katexReady && window.katex) {
+            try {
+              const html = window.katex.renderToString(expr, { throwOnError: false, output: "html" });
+              return <span key={i} dangerouslySetInnerHTML={{ __html: html }} />;
+            } catch {
+              return <span key={i}>{expr}</span>;
+            }
+          }
+          return <span key={i} className="math-loading">{expr}</span>;
+        }
+        return <span key={i}>{seg}</span>;
+      })}
+    </span>
+  );
+}
+
+async function fetchQuestionBatch(subjectDef, difficulty, count, chapterCounts, targetCount, generatedCount, recentTopics) {
   const response = await fetch(BACKEND_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -88,6 +172,10 @@ async function fetchQuestionBatch(subjectDef, difficulty, count) {
       chapters: subjectDef.chapters,
       difficulty,
       count,
+      chapterCounts,
+      targetCount,
+      generatedCount,
+      recentTopics,
     }),
   });
 
@@ -101,7 +189,7 @@ export default function IOEOfficialMock() {
   const [phase, setPhase] = useState("setup"); // setup | exam | results
   const [subjectDefs, setSubjectDefs] = useState(DEFAULT_SUBJECTS);
   const [difficulty, setDifficulty] = useState("Mixed");
-  const [negPct, setNegPct] = useState(5);
+  const [negPct, setNegPct] = useState(10); // IOE's official negative marking is 10% per wrong answer
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const [questions, setQuestions] = useState([]);
@@ -113,12 +201,19 @@ export default function IOEOfficialMock() {
   const [fetchError, setFetchError] = useState(null);
   const [initLoading, setInitLoading] = useState(false);
 
+  const katexReady = useKatexReady();
+
   const fetchingRef = useRef(false);
   const configRef = useRef({ subjectDefs, difficulty });
 
+  // topic-tracking: { [subject]: { [chapter]: count } }, plus a rolling
+  // window of short "topic" labels used to stop the LLM repeating concepts.
+  const chapterCountsRef = useRef({});
+  const recentTopicsRef = useRef([]);
+
   const weightSum = subjectDefs.reduce((a, s) => a + s.weight, 0);
 
-  // section boundaries e.g. [36, 65, 86, 100] scaled to TOTAL_QUESTIONS
+  // section boundaries e.g. [36, 68, 86, 100] scaled to TOTAL_QUESTIONS
   const boundaries = useMemo(() => {
     let acc = 0;
     const raw = subjectDefs.map((s) => {
@@ -130,36 +225,63 @@ export default function IOEOfficialMock() {
     return raw;
   }, [subjectDefs, weightSum]);
 
-  const subjectColor = (name) => subjectDefs.find((s) => s.key === name)?.color || "#2E4057";
-
-  const nextBatchPlan = useCallback(
-    (existingCount) => {
-      if (existingCount >= TOTAL_QUESTIONS) return null;
-      let idx = configRef.current.subjectDefs.findIndex((_, i) => existingCount < boundariesRef.current[i]);
-      if (idx === -1) idx = configRef.current.subjectDefs.length - 1;
-      const sectionStart = idx === 0 ? 0 : boundariesRef.current[idx - 1];
-      const remainingInSection = boundariesRef.current[idx] - existingCount;
-      const count = Math.max(1, Math.min(BATCH_SIZE, remainingInSection));
-      return { subjectDef: configRef.current.subjectDefs[idx], count };
-    },
-    []
-  );
-
   const boundariesRef = useRef(boundaries);
   useEffect(() => {
     boundariesRef.current = boundaries;
   }, [boundaries]);
 
+  const subjectColor = (name) => subjectDefs.find((s) => s.key === name)?.color || "#2E4057";
+
+  const nextBatchPlan = useCallback((existingCount, questionsSoFar) => {
+    if (existingCount >= TOTAL_QUESTIONS) return null;
+    const defs = configRef.current.subjectDefs;
+    const bnds = boundariesRef.current;
+    let idx = defs.findIndex((_, i) => existingCount < bnds[i]);
+    if (idx === -1) idx = defs.length - 1;
+    const sectionStart = idx === 0 ? 0 : bnds[idx - 1];
+    const remainingInSection = bnds[idx] - existingCount;
+    const count = Math.max(1, Math.min(BATCH_SIZE, remainingInSection));
+    const subjectDef = defs[idx];
+    const targetCount = bnds[idx] - sectionStart;
+    const generatedCount = questionsSoFar.filter((q) => q.subject === subjectDef.key).length;
+    return { subjectDef, count, targetCount, generatedCount };
+  }, []);
+
+  const recordGenerated = useCallback((batch) => {
+    for (const q of batch) {
+      const subj = q.subject;
+      const chap = q.chapter || "Unspecified";
+      if (!chapterCountsRef.current[subj]) chapterCountsRef.current[subj] = {};
+      chapterCountsRef.current[subj][chap] = (chapterCountsRef.current[subj][chap] || 0) + 1;
+      if (q.topic) {
+        recentTopicsRef.current.push(`${subj}: ${q.topic}`);
+        if (recentTopicsRef.current.length > RECENT_TOPICS_CAP) {
+          recentTopicsRef.current = recentTopicsRef.current.slice(-RECENT_TOPICS_CAP);
+        }
+      }
+    }
+  }, []);
+
   const loadBatch = useCallback(async () => {
     if (fetchingRef.current) return;
     setQuestions((prevQ) => {
-      const plan = nextBatchPlan(prevQ.length);
+      const plan = nextBatchPlan(prevQ.length, prevQ);
       if (!plan) return prevQ;
       fetchingRef.current = true;
       setFetching(true);
       setFetchError(null);
-      fetchQuestionBatch(plan.subjectDef, configRef.current.difficulty, plan.count)
+      const chapterCounts = chapterCountsRef.current[plan.subjectDef.key] || {};
+      fetchQuestionBatch(
+        plan.subjectDef,
+        configRef.current.difficulty,
+        plan.count,
+        chapterCounts,
+        plan.targetCount,
+        plan.generatedCount,
+        recentTopicsRef.current
+      )
         .then((batch) => {
+          recordGenerated(batch);
           setQuestions((p) => [...p, ...batch]);
         })
         .catch(() => {
@@ -171,11 +293,13 @@ export default function IOEOfficialMock() {
         });
       return prevQ;
     });
-  }, [nextBatchPlan]);
+  }, [nextBatchPlan, recordGenerated]);
 
   const startExam = async () => {
     configRef.current = { subjectDefs, difficulty };
     boundariesRef.current = boundaries;
+    chapterCountsRef.current = {};
+    recentTopicsRef.current = [];
     setQuestions([]);
     setAnswers({});
     setMarked({});
@@ -184,8 +308,17 @@ export default function IOEOfficialMock() {
     setInitLoading(true);
     setFetchError(null);
     try {
-      const plan = nextBatchPlan(0);
-      const batch = await fetchQuestionBatch(plan.subjectDef, difficulty, plan.count);
+      const plan = nextBatchPlan(0, []);
+      const batch = await fetchQuestionBatch(
+        plan.subjectDef,
+        difficulty,
+        plan.count,
+        {},
+        plan.targetCount,
+        plan.generatedCount,
+        []
+      );
+      recordGenerated(batch);
       setQuestions(batch);
       setPhase("exam");
     } catch (e) {
@@ -205,9 +338,14 @@ export default function IOEOfficialMock() {
     return () => clearTimeout(t);
   }, [phase, timeLeft]);
 
+  // Rolling background generation: as soon as the reader is within
+  // PREFETCH_LOOKAHEAD questions of the buffered end, silently top up the
+  // buffer so the next "Next" click never has to wait on the network.
   useEffect(() => {
     if (phase !== "exam") return;
-    if (questions.length < TOTAL_QUESTIONS && questions.length - current <= 2 && !fetchingRef.current) {
+    if (questions.length >= TOTAL_QUESTIONS) return;
+    if (fetchingRef.current) return;
+    if (questions.length - current <= PREFETCH_LOOKAHEAD) {
       loadBatch();
     }
   }, [phase, current, questions.length, loadBatch]);
@@ -227,146 +365,52 @@ export default function IOEOfficialMock() {
     setSubjectDefs((prev) => prev.map((s) => (s.key === key ? { ...s, weight: val } : s)));
   };
 
-  let correctCount = 0, wrongCount = 0, unattempted = 0;
+  let correctCount = 0, wrongCount = 0, unattempted = 0, scoredMarks = 0, maxPossibleMarks = 0;
   const subjectStats = {};
   questions.forEach((q, i) => {
+    const marks = marksForIndex(i);
+    maxPossibleMarks += marks;
     if (!(q.subject in subjectStats)) subjectStats[q.subject] = { correct: 0, total: 0 };
     subjectStats[q.subject].total += 1;
     const ans = answers[i];
     if (ans === undefined) unattempted += 1;
     else if (ans === q.correctIndex) {
       correctCount += 1;
+      scoredMarks += marks;
       subjectStats[q.subject].correct += 1;
-    } else wrongCount += 1;
+    } else {
+      wrongCount += 1;
+      scoredMarks -= marks * (negPct / 100);
+    }
   });
-  const negPerWrong = negPct / 100;
-  const rawScore = correctCount - wrongCount * negPerWrong;
+
   const attempted = correctCount + wrongCount;
   const accuracy = attempted > 0 ? Math.round((correctCount / attempted) * 100) : 0;
 
   const timePct = timeLeft / EXAM_SECONDS;
   const timeBarColor = timePct > 0.5 ? "var(--accent)" : timePct > 0.15 ? "var(--warning)" : "var(--danger)";
 
-  // section label lookup for palette dividers
-  const sectionForIndex = (i) => {
-    let idx = boundaries.findIndex((b) => i < b);
-    if (idx === -1) idx = subjectDefs.length - 1;
-    return subjectDefs[idx];
-  };
-
   return (
     <div className="ioe-root">
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap');
-        .ioe-root {
-          --bg: #F7F6F2; --surface: #FFFFFF; --ink: #1B1B18; --ink-soft: #6B6A63;
-          --border: #E4E2DA; --accent: #2E4057; --accent-soft: #E8ECF1;
-          --danger: #C1443D; --danger-soft: #F7E6E4; --success: #3A7D44; --success-soft: #E7F0E8;
-          --warning: #C97A2B; --warning-soft: #FBEBDA;
-          font-family: 'Inter', sans-serif; background: var(--bg); color: var(--ink);
-          min-height: 100%; width: 100%; box-sizing: border-box;
-        }
-        .ioe-root *, .ioe-root *::before, .ioe-root *::after { box-sizing: border-box; }
-        .ioe-root button { font-family: inherit; cursor: pointer; }
-        .ioe-root input, .ioe-root select { font-family: inherit; }
-        .display { font-family: 'Space Grotesk', sans-serif; }
-        .mono { font-family: 'JetBrains Mono', monospace; }
-        .setup-wrap { max-width: 640px; margin: 0 auto; padding: 40px 24px 64px; }
-        .setup-eyebrow { font-family: 'JetBrains Mono', monospace; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-soft); margin-bottom: 8px; }
-        .setup-title { font-size: 30px; font-weight: 700; margin: 0 0 6px; letter-spacing: -0.01em; }
-        .setup-sub { color: var(--ink-soft); font-size: 15px; margin: 0 0 26px; line-height: 1.5; }
-        .format-card { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 22px 24px; margin-bottom: 24px; }
-        .format-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 18px; }
-        .format-stat-num { font-size: 20px; font-weight: 700; font-family: 'Space Grotesk', sans-serif; }
-        .format-stat-label { font-size: 11px; color: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.04em; margin-top: 2px; }
-        .section-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; font-size: 13px; }
-        .section-dot { width: 9px; height: 9px; border-radius: 3px; flex-shrink: 0; }
-        .section-name { width: 92px; flex-shrink: 0; font-weight: 600; }
-        .section-marks { color: var(--ink-soft); font-family: 'JetBrains Mono', monospace; font-size: 12px; }
-        .section-chapters { color: var(--ink-soft); font-size: 12px; }
-        .field-block { margin-bottom: 22px; }
-        .field-label { font-size: 13px; font-weight: 600; margin-bottom: 10px; display: block; }
-        .select-box { width: 100%; border: 1.5px solid var(--border); background: var(--surface); border-radius: 10px; padding: 11px 14px; font-size: 14px; font-weight: 500; color: var(--ink); }
-        .adv-toggle { display: flex; align-items: center; gap: 7px; background: none; border: none; color: var(--ink-soft); font-size: 13px; font-weight: 600; padding: 0; margin-bottom: 16px; }
-        .adv-panel { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 20px; margin-bottom: 22px; }
-        .weight-row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
-        .weight-label { width: 100px; font-size: 13px; font-weight: 600; flex-shrink: 0; }
-        .weight-input { width: 64px; border: 1.5px solid var(--border); border-radius: 8px; padding: 6px 8px; font-size: 13px; font-family: 'JetBrains Mono', monospace; }
-        .start-btn { width: 100%; background: var(--accent); color: white; border: none; border-radius: 12px; padding: 16px; font-size: 15px; font-weight: 700; display: flex; align-items: center; justify-content: center; gap: 8px; margin-top: 8px; }
-        .start-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-        .error-banner { background: var(--danger-soft); color: var(--danger); border-radius: 10px; padding: 12px 14px; font-size: 13.5px; margin-top: 14px; display: flex; gap: 8px; align-items: flex-start; }
-        .exam-topbar { display: flex; align-items: center; justify-content: space-between; padding: 18px 28px; border-bottom: 1px solid var(--border); background: var(--surface); position: sticky; top: 0; z-index: 5; }
-        .timer-block { display: flex; align-items: center; gap: 10px; }
-        .timer-num { font-size: 20px; font-weight: 700; }
-        .time-bar-track { height: 4px; background: var(--border); width: 100%; border-radius: 999px; overflow: hidden; position: sticky; top: 63px; z-index: 5; }
-        .time-bar-fill { height: 100%; transition: width 1s linear, background 0.3s ease; }
-        .submit-btn { background: var(--ink); color: white; border: none; border-radius: 8px; padding: 10px 20px; font-weight: 700; font-size: 13.5px; }
-        .exam-shell { display: flex; min-height: 100%; }
-        .exam-main { flex: 1; padding: 0 28px 28px; min-width: 0; }
-        .q-card { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 32px; margin-top: 24px; }
-        .q-meta { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
-        .subject-tag { font-size: 12px; font-weight: 700; padding: 5px 12px; border-radius: 999px; color: white; text-transform: uppercase; letter-spacing: 0.04em; }
-        .chapter-tag { font-size: 12px; color: var(--ink-soft); margin-bottom: 16px; }
-        .mark-btn { display: flex; align-items: center; gap: 6px; background: none; border: 1.5px solid var(--border); border-radius: 999px; padding: 6px 14px; font-size: 12.5px; font-weight: 600; color: var(--ink-soft); }
-        .mark-btn.on { background: var(--warning-soft); color: var(--warning); border-color: transparent; }
-        .q-text { font-size: 18px; font-weight: 600; line-height: 1.5; margin-bottom: 22px; }
-        .opt { display: flex; align-items: center; gap: 12px; border: 1.5px solid var(--border); border-radius: 12px; padding: 14px 16px; margin-bottom: 10px; font-size: 14.5px; font-weight: 500; transition: all 0.12s ease; }
-        .opt:hover { border-color: var(--accent); }
-        .opt.selected { border-color: var(--accent); background: var(--accent-soft); }
-        .opt-letter { width: 26px; height: 26px; border-radius: 50%; border: 1.5px solid var(--border); display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; flex-shrink: 0; font-family: 'JetBrains Mono', monospace; }
-        .opt.selected .opt-letter { background: var(--accent); border-color: var(--accent); color: white; }
-        .nav-row { display: flex; justify-content: space-between; margin-top: 22px; }
-        .nav-btn { display: flex; align-items: center; gap: 6px; background: var(--surface); border: 1.5px solid var(--border); border-radius: 10px; padding: 10px 18px; font-weight: 600; font-size: 13.5px; }
-        .nav-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-        .nav-btn.primary { background: var(--accent); color: white; border-color: transparent; }
-        .palette-panel { width: 270px; flex-shrink: 0; border-left: 1px solid var(--border); padding: 24px 20px; background: var(--surface); overflow-y: auto; }
-        .palette-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-soft); margin-bottom: 14px; }
-        .palette-section-label { font-size: 11px; font-weight: 700; margin: 14px 0 8px; display: flex; align-items: center; gap: 6px; }
-        .palette-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 7px; }
-        .palette-cell { aspect-ratio: 1; border-radius: 7px; border: 1.5px solid var(--border); font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center; background: var(--surface); color: var(--ink-soft); position: relative; }
-        .palette-cell.answered { color: white; border-color: transparent; }
-        .palette-cell.marked { border-color: var(--warning); }
-        .palette-cell.marked::after { content: ''; position: absolute; top: -3px; right: -3px; width: 7px; height: 7px; border-radius: 50%; background: var(--warning); }
-        .palette-cell.current { outline: 2.5px solid var(--ink); outline-offset: 2px; }
-        .gen-status { margin-top: 18px; display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink-soft); }
-        .results-wrap { max-width: 780px; margin: 0 auto; padding: 44px 24px 80px; }
-        .score-hero { background: var(--ink); color: white; border-radius: 20px; padding: 36px; margin-bottom: 28px; }
-        .score-num { font-size: 52px; font-weight: 700; font-family: 'Space Grotesk', sans-serif; line-height: 1; }
-        .score-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 18px; margin-top: 24px; }
-        .stat-num { font-size: 22px; font-weight: 700; }
-        .stat-label { font-size: 11.5px; color: rgba(255,255,255,0.6); text-transform: uppercase; letter-spacing: 0.05em; margin-top: 2px; }
-        .subj-bar-row { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
-        .subj-bar-label { width: 110px; font-size: 13px; font-weight: 600; flex-shrink: 0; }
-        .subj-bar-track { flex: 1; height: 10px; background: var(--border); border-radius: 999px; overflow: hidden; }
-        .subj-bar-fill { height: 100%; border-radius: 999px; }
-        .subj-bar-frac { width: 48px; text-align: right; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--ink-soft); flex-shrink: 0; }
-        .review-card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 22px; margin-bottom: 14px; }
-        .review-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
-        .review-q { font-size: 15px; font-weight: 600; margin-bottom: 12px; line-height: 1.5; }
-        .review-opt { display: flex; align-items: center; gap: 10px; padding: 8px 0; font-size: 13.5px; }
-        .review-explain { margin-top: 12px; padding: 12px 14px; background: var(--bg); border-radius: 10px; font-size: 13px; color: var(--ink-soft); line-height: 1.5; }
-        .restart-btn { display: flex; align-items: center; gap: 8px; justify-content: center; width: 100%; background: var(--accent); color: white; border: none; border-radius: 12px; padding: 15px; font-weight: 700; font-size: 14.5px; margin-top: 8px; }
-        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-      `}</style>
-
       {phase === "setup" && (
         <div className="setup-wrap">
-          <div className="setup-eyebrow">IOE B.E./B.Arch Entrance · Full Mock</div>
-          <h1 className="setup-title display">A fresh 100-question paper, every attempt</h1>
-          <p className="setup-sub">Each mock is generated live to match the current official format — same question count, marking scheme, and syllabus weightage every time, with entirely new questions.</p>
+          <div className="setup-eyebrow">IOE B.E./B.Arch Entrance · 2083/84 Pattern</div>
+          <h1 className="setup-title display">A fresh {TOTAL_QUESTIONS}-question paper, every attempt</h1>
+          <p className="setup-sub">Each mock is generated live to match the current official format — {TOTAL_QUESTIONS} questions, {TOTAL_MARKS} marks (Part A: {PART_A_COUNT}×1 mark, Part B: {PART_B_COUNT}×2 marks), 10% negative marking — with entirely new, syllabus-balanced questions every time.</p>
 
           <div className="format-card">
             <div className="format-grid">
-              <div><div className="format-stat-num">100</div><div className="format-stat-label">Questions</div></div>
-              <div><div className="format-stat-num">100</div><div className="format-stat-label">Marks</div></div>
+              <div><div className="format-stat-num">{TOTAL_QUESTIONS}</div><div className="format-stat-label">Questions</div></div>
+              <div><div className="format-stat-num">{TOTAL_MARKS}</div><div className="format-stat-label">Marks</div></div>
               <div><div className="format-stat-num">2:00:00</div><div className="format-stat-label">Duration</div></div>
               <div><div className="format-stat-num">−{negPct}%</div><div className="format-stat-label">Per wrong</div></div>
             </div>
-            {subjectDefs.map((s, i) => (
+            <div className="part-note">Part A: Q1–{PART_A_COUNT} · 1 mark each &nbsp;·&nbsp; Part B: Q{PART_A_COUNT + 1}–{TOTAL_QUESTIONS} · 2 marks each</div>
+            {subjectDefs.map((s) => (
               <div className="section-row" key={s.key}>
                 <span className="section-dot" style={{ background: s.color }} />
                 <span className="section-name">{s.key}</span>
-                <span className="section-marks">{Math.round((s.weight / weightSum) * TOTAL_QUESTIONS)} marks</span>
+                <span className="section-marks">{Math.round((s.weight / weightSum) * TOTAL_QUESTIONS)} questions</span>
                 <span className="section-chapters">· {s.chapters.length} chapters</span>
               </div>
             ))}
@@ -403,10 +447,10 @@ export default function IOEOfficialMock() {
               <div className="weight-row" style={{ marginTop: 6, borderTop: "1px solid var(--border)", paddingTop: 14 }}>
                 <span className="weight-label">Negative %</span>
                 <input type="number" className="weight-input" value={negPct} onChange={(e) => setNegPct(Number(e.target.value) || 0)} />
-                <span style={{ fontSize: 12, color: "var(--ink-soft)" }}>deducted per wrong answer</span>
+                <span style={{ fontSize: 12, color: "var(--ink-soft)" }}>deducted per wrong answer (official IOE value is 10%)</span>
               </div>
               <div style={{ fontSize: 12, color: "var(--ink-soft)", marginTop: 10, lineHeight: 1.5 }}>
-                Weights scale proportionally to fill exactly 100 marks — update these if IOE revises the official weightage.
+                Weights scale proportionally across {TOTAL_QUESTIONS} questions — defaults mirror the official {TOTAL_MARKS}-mark subject split (Math 50 / Physics 45 / Chemistry 25 / English 20).
               </div>
             </div>
           )}
@@ -445,20 +489,22 @@ export default function IOEOfficialMock() {
               {(() => {
                 const q = questions[current];
                 if (!q) return null;
+                const marks = marksForIndex(current);
                 return (
                   <div className="q-card">
                     <div className="q-meta">
                       <span className="subject-tag" style={{ background: subjectColor(q.subject) }}>{q.subject}</span>
+                      <span className="marks-tag">{marks} mark{marks > 1 ? "s" : ""}</span>
                       <button className={`mark-btn ${marked[current] ? "on" : ""}`} onClick={() => toggleMark(current)}>
                         <Flag size={13} /> {marked[current] ? "Marked" : "Mark for review"}
                       </button>
                     </div>
                     {q.chapter && <div className="chapter-tag">{q.chapter}</div>}
-                    <div className="q-text">{q.question}</div>
+                    <div className="q-text"><MathText text={q.question} katexReady={katexReady} /></div>
                     {q.options.map((opt, i) => (
                       <div key={i} className={`opt ${answers[current] === i ? "selected" : ""}`} onClick={() => selectAnswer(current, i)}>
                         <span className="opt-letter">{String.fromCharCode(65 + i)}</span>
-                        <span>{opt}</span>
+                        <MathText text={opt} katexReady={katexReady} />
                       </div>
                     ))}
                     <div className="nav-row">
@@ -520,7 +566,7 @@ export default function IOEOfficialMock() {
           <div className="setup-eyebrow">IOE Full Mock — Results</div>
           <div className="score-hero">
             <div style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: "0.06em", color: "rgba(255,255,255,0.6)", marginBottom: 6 }}>Net score</div>
-            <div className="score-num">{rawScore.toFixed(2)} <span style={{ fontSize: 20, fontWeight: 500, color: "rgba(255,255,255,0.55)" }}>/ 100</span></div>
+            <div className="score-num">{scoredMarks.toFixed(2)} <span style={{ fontSize: 20, fontWeight: 500, color: "rgba(255,255,255,0.55)" }}>/ {maxPossibleMarks || TOTAL_MARKS}</span></div>
             <div className="score-stats">
               <div><div className="stat-num" style={{ color: "#7CC08A" }}>{correctCount}</div><div className="stat-label">Correct</div></div>
               <div><div className="stat-num" style={{ color: "#E1948E" }}>{wrongCount}</div><div className="stat-label">Wrong</div></div>
@@ -542,25 +588,27 @@ export default function IOEOfficialMock() {
           {questions.map((q, i) => {
             const ans = answers[i];
             const isCorrect = ans === q.correctIndex;
+            const marks = marksForIndex(i);
             return (
               <div className="review-card" key={i}>
                 <div className="review-head">
                   <span className="subject-tag" style={{ background: subjectColor(q.subject) }}>{q.subject}</span>
+                  <span className="marks-tag">{marks} mark{marks > 1 ? "s" : ""}</span>
                   {ans === undefined ? <MinusCircle size={16} color="var(--ink-soft)" /> : isCorrect ? <CheckCircle2 size={16} color="var(--success)" /> : <XCircle size={16} color="var(--danger)" />}
                   <span style={{ fontSize: 12, fontWeight: 600, color: "var(--ink-soft)" }}>Q{i + 1}</span>
                 </div>
-                <div className="review-q">{q.question}</div>
+                <div className="review-q"><MathText text={q.question} katexReady={katexReady} /></div>
                 {q.options.map((opt, oi) => {
                   let color = "var(--ink-soft)", icon = null;
                   if (oi === q.correctIndex) { color = "var(--success)"; icon = <CheckCircle2 size={14} color="var(--success)" />; }
                   else if (oi === ans) { color = "var(--danger)"; icon = <XCircle size={14} color="var(--danger)" />; }
                   return (
                     <div className="review-opt" key={oi} style={{ color, fontWeight: oi === q.correctIndex || oi === ans ? 600 : 400 }}>
-                      {icon || <span style={{ width: 14 }} />}{opt}
+                      {icon || <span style={{ width: 14 }} />}<MathText text={opt} katexReady={katexReady} />
                     </div>
                   );
                 })}
-                <div className="review-explain">{q.explanation}</div>
+                <div className="review-explain"><MathText text={q.explanation} katexReady={katexReady} /></div>
               </div>
             );
           })}
