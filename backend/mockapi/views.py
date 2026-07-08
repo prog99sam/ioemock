@@ -51,12 +51,48 @@ def wait_for_rate_limit():
 # ---------------------------------------------------------------------------
 
 
+_MATRIX_ENV_RE = re.compile(
+    r'\\begin\{(matrix|pmatrix|bmatrix|vmatrix|Vmatrix|array|cases|aligned)\}'
+    r'[\s\S]*?\\end\{\1\}'
+)
+
+
+def _protect_matrix_blocks(text):
+    """Pulls out \\begin{...}...\\end{...} environments (matrices,
+    determinants, systems of equations) so the token-level cleanup below
+    never touches their internal & / \\\\ structure. Returns the text with
+    placeholders plus a dict to restore them, each wrapped as display math."""
+    blocks = {}
+
+    def stash(match):
+        placeholder = f"\x00MATBLK{len(blocks)}\x00"
+        block = match.group(0)
+        # Wrap the whole environment as its own display-math expression.
+        blocks[placeholder] = f"$${block}$$"
+        return placeholder
+
+    protected = _MATRIX_ENV_RE.sub(stash, text)
+    return protected, blocks
+
+
+def _restore_matrix_blocks(text, blocks):
+    for placeholder, wrapped in blocks.items():
+        text = text.replace(placeholder, wrapped)
+    return text
+
+
 def normalize_latex(text):
     """Best-effort cleanup of near-LaTeX the model sometimes emits, and makes
-    sure every math snippet is wrapped in $...$ so the frontend's KaTeX
-    renderer picks it up. Idempotent-ish: safe to run on already-clean text."""
+    sure every math snippet is wrapped in $...$ (or $$...$$ for matrix/array
+    environments) so the frontend's KaTeX renderer picks it up cleanly.
+    Idempotent-ish: safe to run on already-clean text."""
     if not text:
         return text
+
+    # Matrix/determinant/system-of-equations environments are wrapped whole
+    # and shielded from the token-by-token rules below, which would otherwise
+    # break their & / \\ row-column structure apart.
+    text, matrix_blocks = _protect_matrix_blocks(text)
 
     # Bare `frac{a}{b}`, `sqrt{x}` / `sqrt(x)` missing their backslash.
     text = re.sub(r'(?<!\\)\bfrac\{', r'\\frac{', text)
@@ -72,16 +108,15 @@ def normalize_latex(text):
         text = re.sub(rf'(?<![\\a-zA-Z]){g}(?![a-zA-Z])', rf'\\{g}', text)
 
     # Wrap any run containing a LaTeX command or ^ / _ math syntax in $...$
-    # if it isn't already inside $ ... $ delimiters.
+    # if it isn't already inside $ ... $ delimiters (matrix blocks are
+    # already placeholder tokens by this point, so they're untouched).
     def wrap_math(match):
         return f"${match.group(0)}$"
 
-    # Only touch segments outside existing $...$ spans.
-    parts = re.split(r'(\$[^$]*\$)', text)
+    parts = re.split(r'(\$\$[\s\S]*?\$\$|\$[^$]*\$)', text)
     for i, part in enumerate(parts):
         if part.startswith('$'):
             continue
-        # Find LaTeX-ish runs: \command...{...} or x^{..} or x_{..}
         parts[i] = re.sub(
             r'(\\[a-zA-Z]+(\{[^{}]*\}|\^\{[^{}]*\}|_\{[^{}]*\})*'
             r'(\^\{[^{}]*\}|_\{[^{}]*\}|\{[^{}]*\})*|'
@@ -92,8 +127,10 @@ def normalize_latex(text):
         )
     text = "".join(parts)
     # Collapse accidental doubled $$..$$ from re-wrapping adjacent tokens.
-    text = re.sub(r'\$\$+', '$', text)
-    text = re.sub(r'\$\s*\$', '', text)
+    text = re.sub(r'\${3,}', '$$', text)
+    text = re.sub(r'\$\s*\$(?!\$)', '', text)
+
+    text = _restore_matrix_blocks(text, matrix_blocks)
     return text
 
 
@@ -158,8 +195,9 @@ STRICT RULES:
 4. Every question must be fully self-contained and solvable from text alone (no images/diagrams/figures required).
 5. Distractors (wrong options) must be plausible -- based on common calculation errors or conceptual confusions, not random or obviously wrong.
 6. Keep explanations concise (1-2 sentences) but mathematically correct.
-7. ALL mathematics, anywhere it appears (question, options, explanation), MUST be written in standard LaTeX, wrapped in single dollar signs for inline math. Examples of correct formatting: $\\frac{{4}}{{7}}$, $2^{{x}}$, $\\sqrt{{x}}$, $\\theta$, $\\pi$, $\\int_0^1 x\\,dx$. Never write raw pseudo-LaTeX like "frac{{4}}{{7}}" or "sqrt(x)" without the backslash and dollar signs.
-8. Return ONLY a raw JSON object -- no markdown fences, no preamble, no commentary, no trailing text.
+7. ALL mathematics, anywhere it appears (question, options, explanation), MUST be written in standard LaTeX. Wrap simple inline expressions in single dollar signs: $\\frac{{4}}{{7}}$, $2^{{x}}$, $\\sqrt{{x}}$, $\\theta$, $\\pi$, $\\int_0^1 x\\,dx$. Never write raw pseudo-LaTeX like "frac{{4}}{{7}}" or "sqrt(x)" without the backslash and dollar signs.
+8. Matrices, determinants, and systems of equations MUST use a proper LaTeX array environment (not inline fractions or plain text), wrapped in double dollar signs as display math. Use \\begin{{vmatrix}} ... \\end{{vmatrix}} for determinants, \\begin{{pmatrix}} ... \\end{{pmatrix}} or \\begin{{bmatrix}} ... \\end{{bmatrix}} for matrices, with & separating columns and \\\\ separating rows. Example determinant: $$\\begin{{vmatrix}} 1 & a & a^{{2}} \\\\ 1 & b & b^{{2}} \\\\ 1 & c & c^{{2}} \\end{{vmatrix}}$$. Never lay out matrix rows as plain inline text.
+9. Return ONLY a raw JSON object -- no markdown fences, no preamble, no commentary, no trailing text.
 
 Respond with exactly this JSON schema:
 {{"questions": [{{"question":"...","options":["...","...","...","..."],"correctIndex":0,"explanation":"...","chapter":"<one of the exact chapter strings listed above>","topic":"short 3-8 word label for the specific concept tested, e.g. 'projectile motion range formula'"}}]}}

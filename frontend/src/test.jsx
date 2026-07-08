@@ -4,7 +4,6 @@ import "./test.css";
 
 const BACKEND_URL = "https://api.samiramgain.com.np/api/generate-questions/";
 const BATCH_SIZE = 4;
-const PREFETCH_LOOKAHEAD = 2; // start fetching the next batch this many questions before running out
 const TOTAL_QUESTIONS = 100;
 const PART_A_COUNT = 60; // 1 mark each
 const PART_B_COUNT = 40; // 2 marks each
@@ -137,20 +136,37 @@ function useKatexReady() {
 // Renders text containing $...$ inline LaTeX spans via KaTeX; falls back to
 // plain text for anything KaTeX can't parse or before it has loaded.
 function MathText({ text, katexReady, className }) {
+  // Split on $$...$$ (display math — matrices, determinants, multi-line
+  // expressions) before falling back to single $...$ (inline math).
   const segments = useMemo(() => {
     if (!text) return [];
-    return String(text).split(/(\$[^$]+\$)/g).filter((s) => s !== "");
+    return String(text)
+      .split(/(\$\$[\s\S]+?\$\$|\$[^$]+\$)/g)
+      .filter((s) => s !== "");
   }, [text]);
 
   return (
     <span className={className}>
       {segments.map((seg, i) => {
-        if (seg.startsWith("$") && seg.endsWith("$") && seg.length > 2) {
-          const expr = seg.slice(1, -1);
+        const isDisplay = seg.startsWith("$$") && seg.endsWith("$$") && seg.length > 4;
+        const isInline = !isDisplay && seg.startsWith("$") && seg.endsWith("$") && seg.length > 2;
+        if (isDisplay || isInline) {
+          const expr = isDisplay ? seg.slice(2, -2) : seg.slice(1, -1);
           if (katexReady && window.katex) {
             try {
-              const html = window.katex.renderToString(expr, { throwOnError: false, output: "html" });
-              return <span key={i} dangerouslySetInnerHTML={{ __html: html }} />;
+              const html = window.katex.renderToString(expr, {
+                throwOnError: false,
+                output: "html",
+                displayMode: isDisplay,
+              });
+              const Wrapper = isDisplay ? "span" : "span";
+              return (
+                <Wrapper
+                  key={i}
+                  className={isDisplay ? "math-display" : undefined}
+                  dangerouslySetInnerHTML={{ __html: html }}
+                />
+              );
             } catch {
               return <span key={i}>{expr}</span>;
             }
@@ -338,17 +354,16 @@ export default function IOEOfficialMock() {
     return () => clearTimeout(t);
   }, [phase, timeLeft]);
 
-  // Rolling background generation: as soon as the reader is within
-  // PREFETCH_LOOKAHEAD questions of the buffered end, silently top up the
-  // buffer so the next "Next" click never has to wait on the network.
+  // Rolling background generation: the moment one batch lands, immediately
+  // kick off the request for the next one — independent of which question
+  // the user is currently viewing — so the whole paper keeps filling in
+  // the background until all TOTAL_QUESTIONS are buffered.
   useEffect(() => {
     if (phase !== "exam") return;
     if (questions.length >= TOTAL_QUESTIONS) return;
     if (fetchingRef.current) return;
-    if (questions.length - current <= PREFETCH_LOOKAHEAD) {
-      loadBatch();
-    }
-  }, [phase, current, questions.length, loadBatch]);
+    loadBatch();
+  }, [phase, questions.length, loadBatch]);
 
   const selectAnswer = (qIdx, optIdx) => setAnswers((prev) => ({ ...prev, [qIdx]: optIdx }));
   const toggleMark = (qIdx) => setMarked((prev) => ({ ...prev, [qIdx]: !prev[qIdx] }));

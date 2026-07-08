@@ -81,7 +81,10 @@
 
 /* math rendering */
 .math-loading { opacity: 0.55; font-style: italic; }
-.katex { font-size: 1.02em; }
+.katex { font-size: 1.05em; }
+.math-display { display: block; margin: 10px 0; overflow-x: auto; overflow-y: hidden; padding: 4px 0; }
+.math-display .katex-display { margin: 0; }
+.opt .math-display, .review-opt .math-display { display: inline-block; margin: 0; vertical-align: middle; }
 
 /* ---------- palette ---------- */
 .palette-panel { width: 270px; flex-shrink: 0; border-left: 1px solid var(--border); padding: 24px 20px; background: var(--surface); overflow-y: auto; }
